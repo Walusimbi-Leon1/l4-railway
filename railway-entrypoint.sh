@@ -11,7 +11,16 @@ WORKDIR="/root/projects/Codespace-3"
 export HOME="/root"
 PORT="${PORT:-8080}"
 USERNAME="${USERNAME:-admin}"
-PASSWORD="${PASSWORD:-admin}"
+PASSWORD="${PASSWORD:-changeme}"
+
+# Detect Railway Volume (mounts are often /railway or /data)
+RAILWAY_VOLUME=""
+for mp in /railway /data /volumes; do
+  if mount | grep -q " $mp "; then
+    RAILWAY_VOLUME="$mp"
+    break
+  fi
+done
 
 echo "=============================================="
 echo "  🐾 L4 Claw Pack — Railway Boot"
@@ -84,6 +93,14 @@ if [ -d "$WORKDIR" ]; then
   echo "  ✅ Repo at $(git rev-parse --short HEAD 2>/dev/null || echo 'unknown')"
 fi
 
+# ── 5b. Fix workspace path symlink ──
+if [ -d "$WORKDIR" ] && [ "$(readlink -f /workspaces/Codespace-3 2>/dev/null || echo '')" != "$WORKDIR" ]; then
+  rm -rf /workspaces/Codespace-3
+  mkdir -p /workspaces
+  ln -sfn "$WORKDIR" /workspaces/Codespace-3
+  echo "  ✅ Workspace symlink: /workspaces/Codespace-3 → $WORKDIR"
+fi
+
 # ── 6. Install global npm packages ──
 if [ -d "$WORKDIR" ]; then
   cd "$WORKDIR"
@@ -95,11 +112,31 @@ if [ -d "$WORKDIR" ]; then
   done
 fi
 
-# ── 7. Set up OpenClaw config and session symlink ──
+# ── 7. Set up OpenClaw config and persistence ──
 if [ -d "$WORKDIR" ]; then
   mkdir -p ~/.openclaw
   [ -f "$WORKDIR/openclaw-config.json" ] && cp "$WORKDIR/openclaw-config.json" ~/.openclaw/openclaw.json
 
+  # ── 7a. Persist OpenClaw state ──
+  if [ -n "$RAILWAY_VOLUME" ]; then
+    STATE_DIR="$RAILWAY_VOLUME/l4-openclaw-state"
+    echo "  📦 Railway Volume detected — persisting OpenClaw state at $STATE_DIR"
+  else
+    STATE_DIR="$WORKDIR/.openclaw-state"
+    echo "  📁 Storing OpenClaw state in workspace (no volume)"
+  fi
+  mkdir -p "$STATE_DIR"
+  
+  STATE_TARGET="$HOME/.openclaw/state"
+  mkdir -p "$(dirname "$STATE_TARGET")"
+  if [ -e "$STATE_TARGET" ] && [ ! -L "$STATE_TARGET" ]; then
+    cp -a "$STATE_TARGET/." "$STATE_DIR/" 2>/dev/null || true
+    rm -rf "$STATE_TARGET"
+  fi
+  ln -sfn "$STATE_DIR" "$STATE_TARGET"
+  echo "  🔗 State: $STATE_TARGET → $STATE_DIR"
+
+  # ── 7b. Session symlink ──
   SESSIONS_SRC="$HOME/.openclaw/agents/main/sessions"
   SESSIONS_DST="$WORKDIR/sessions"
   mkdir -p "$SESSIONS_DST" "$(dirname "$SESSIONS_SRC")"
@@ -108,6 +145,7 @@ if [ -d "$WORKDIR" ]; then
     rm -rf "$SESSIONS_SRC"
   fi
   ln -sfn "$SESSIONS_DST" "$SESSIONS_SRC"
+  echo "  🔗 Sessions: $SESSIONS_SRC → $SESSIONS_DST"
 fi
 
 # ── 8. Start 9-router ──
