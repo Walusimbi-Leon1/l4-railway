@@ -148,7 +148,101 @@ if [ -d "$WORKDIR" ]; then
   echo "  🔗 Sessions: $SESSIONS_SRC → $SESSIONS_DST"
 fi
 
-# ── 8. Start 9-router ──
+# ── 8. Start Tailscale (persistent mesh VPN) ──
+# Installs tailscale if missing, starts daemon, connects, and launches
+# a background watchdog that keeps the connection alive forever.
+echo "🔗 Tailscale: setting up..."
+if ! command -v tailscale &>/dev/null; then
+  echo "  Installing Tailscale..."
+  # Install via official script
+  curl -fsSL https://tailscale.com/install.sh | sh
+fi
+
+# Proc check helper (no ps/pgrep dependency)
+proc_running() {
+  local name="$1"
+  for pid_dir in /proc/[0-9]*/; do
+    local cmdline_file="${pid_dir}cmdline"
+    if [ -r "$cmdline_file" ] && grep -q "$name" "$cmdline_file" 2>/dev/null; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+TAILSCALE_AUTH_KEY="tskey-auth-kPjwrx2hmB21CNTRL-WtQZT8U4t5gB9PC9XTEm5gRAQ4xaHqhrK"
+
+# Kill stale tailscaled if any
+if proc_running "tailscaled"; then
+  for _pid_dir in /proc/[0-9]*/; do
+    _cmdline="${_pid_dir}cmdline"
+    if [ -r "$_cmdline" ] && grep -q "tailscaled" "$_cmdline" 2>/dev/null; then
+      _pid=$(basename "$_pid_dir")
+      kill "$_pid" 2>/dev/null || true
+    fi
+  done
+  sleep 2
+fi
+
+# Start tailscaled
+echo "  Starting tailscaled (userspace networking)..."
+tailscaled --tun=userspace-networking \
+  --state=/var/lib/tailscale/tailscaled.state &>/tmp/tailscaled.log &
+sleep 4
+
+# Authenticate
+echo "  Authenticating with auth key..."
+tailscale up --auth-key="$TAILSCALE_AUTH_KEY" --ssh --accept-routes
+TS_IP=$(tailscale status --peers=false 2>/dev/null | head -1 | awk '{print $1}' || echo "?")
+echo "  ✅ Tailscale connected ($TS_IP)"
+
+# ── 8b. Launch tailscale watchdog (persistent keep-alive) ──
+# First try the repo's script, then fall back to inline
+WATCHDOG_SCRIPT="$WORKDIR/bin/tailscale-watchdog"
+if [ -x "$WATCHDOG_SCRIPT" ]; then
+  if [ -f /tmp/tailscale-watchdog.pid ] && [ -d "/proc/$(cat /tmp/tailscale-watchdog.pid 2>/dev/null)" ] && \
+     grep -q tailscale "/proc/$(cat /tmp/tailscale-watchdog.pid 2>/dev/null)/cmdline" 2>/dev/null; then
+    echo "  ✅ Tailscale watchdog already running"
+  else
+    echo "  🐾 Launching tailscale watchdog..."
+    nohup bash "$WATCHDOG_SCRIPT" &>/dev/null &
+    echo "  ✅ Watchdog launched (PID $!)"
+  fi
+else
+  # Inline fallback watchdog — keeps tailscaled alive and reconnects
+  echo "  🐾 Launching inline tailscale watchdog..."
+  nohup bash -c '
+    while true; do
+      sleep 15
+      # Check if tailscaled is alive
+      alive=false
+      for p in /proc/[0-9]*/cmdline; do
+        if [ -r "$p" ] && grep -q tailscaled "$p" 2>/dev/null; then
+          alive=true
+          break
+        fi
+      done
+      if [ "$alive" = false ]; then
+        echo "[$(date)] Watchdog: tailscaled died, restarting..." >> /tmp/tailscale-watchdog.log
+        tailscaled --tun=userspace-networking --state=/var/lib/tailscale/tailscaled.state &>/tmp/tailscaled.log &
+        sleep 4
+        tailscale up --auth-key="'"$TAILSCALE_AUTH_KEY"'" --ssh --accept-routes &>/tmp/tailscale-up.log
+        echo "[$(date)] Watchdog: reconnected" >> /tmp/tailscale-watchdog.log
+      fi
+      # Periodic health re-check every ~75s
+      if [ $((SECONDS % 75)) -lt 15 ] && [ "$alive" = true ]; then
+        ip=$(tailscale status --peers=false 2>/dev/null | head -1 | awk "{print \$1}" || echo "")
+        if [ -z "$ip" ]; then
+          echo "[$(date)] Watchdog: stale connection, re-upping..." >> /tmp/tailscale-watchdog.log
+          tailscale up --auth-key="'"$TAILSCALE_AUTH_KEY"'" --ssh --accept-routes &>/tmp/tailscale-up.log
+        fi
+      fi
+    done
+  ' &>/dev/null &
+  echo "  ✅ Inline watchdog launched (PID $!)"
+fi
+
+# ── 9. Start 9-router ──
 if ! pgrep -f "node.*9router" >/dev/null 2>&1; then
   echo "🌐 Starting 9-router..."
   nohup 9router --port 20128 --host 127.0.0.1 --tray --skip-update &>/tmp/9router.log &
@@ -156,7 +250,7 @@ if ! pgrep -f "node.*9router" >/dev/null 2>&1; then
   pgrep -f "node.*9router" >/dev/null 2>&1 && echo "  ✅ 9-router on port 20128" || echo "  ⚠️  9-router failed"
 fi
 
-# ── 9. Start OpenClaw Gateway ──
+# ── 10. Start OpenClaw Gateway ──
 if ! curl -sf http://127.0.0.1:18789/health >/dev/null 2>&1; then
   echo "🤖 Starting OpenClaw..."
   openclaw gateway run --port 18789 --bind loopback &>/tmp/openclaw-gateway.log &
@@ -164,7 +258,7 @@ if ! curl -sf http://127.0.0.1:18789/health >/dev/null 2>&1; then
   curl -sf http://127.0.0.1:18789/health >/dev/null 2>&1 && echo "  ✅ OpenClaw on port 18789" || echo "  ⚠️  OpenClaw starting..."
 fi
 
-# ── 10. Start Git Dashboard ──
+# ── 11. Start Git Dashboard ──
 if ! lsof -ti :3030 >/dev/null 2>&1; then
   echo "📝 Starting Git Dashboard..."
   if [ -d "$WORKDIR/git-dashboard" ]; then
@@ -173,21 +267,23 @@ if ! lsof -ti :3030 >/dev/null 2>&1; then
   fi
 fi
 
-# ── 11. Update bashrc ──
+# ── 12. Update bashrc ──
 echo "cd $WORKDIR" >> ~/.bashrc 2>/dev/null || true
 echo "neofetch || true" >> ~/.bashrc 2>/dev/null || true
 
-# ── 12. Summary ──
+# ── 13. Summary ──
+TS_IP=$(tailscale status --peers=false 2>/dev/null | head -1 | awk '{print $1}' || echo "?")
 echo ""
 echo "=============================================="
 echo "  ✅ All services started"
 echo "  🌐 9-router:     http://127.0.0.1:20128"
 echo "  🤖 OpenClaw:     http://127.0.0.1:18789"
 echo "  📝 Git Dashboard: http://127.0.0.1:3030"
+echo "  🔗 Tailscale:    $TS_IP"
 echo "  🖥️  Terminal:     http://... (Railway domain)"
 echo "=============================================="
 echo ""
 
-# ── 13. Keep alive with ttyd ──
+# ── 14. Keep alive with ttyd ──
 echo "🖥️  Starting ttyd web terminal..."
 exec /usr/local/bin/ttyd --writable -i 0.0.0.0 -p "$PORT" -c "${USERNAME}:${PASSWORD}" /bin/bash
